@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""The DM_* (and DMSH_VK_*) environment switches the code reads, as one table: docs/env_switches.tsv (name, class, meaning; class and meaning kept by hand, docs/development.md says what
+the classes are).
+  env_switches.py           write the table: a new switch gets a row with a guessed class and no meaning, a switch nothing reads any more loses its row
+  env_switches.py --check   exit 1 when the table does not list exactly the switches the sources read, or a row has no meaning or an unknown class
+Either prints the names the docs quote that nothing reads (a removed switch a doc may still describe as working).
+Switches read by vendored third-party code (dm/third_party is not scanned) are listed in dm/tools/env_switches_vendored.tsv (name, module directory under dm/third_party). Such a
+switch counts as read by the module. When the module's directory is present its sources are scanned too, and a listed switch the module does not read loses its row like any other;
+while the module is not vendored yet the list is trusted."""
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+REPO = Path(__file__).resolve().parents[2]
+TABLE = REPO / 'docs/env_switches.tsv'
+VENDORED = REPO / 'dm/tools/env_switches_vendored.tsv'   # name<TAB>module: switches read by dm/third_party/<module>
+HEAD = 'name\tclass\tmeaning\n'
+CLASSES = ('player', 'path', 'switch', 'diagnostic', 'test')
+CODE = ('.c', '.m', '.h', '.inc', '.swift', '.py', '.sh', '.S')
+NAME = r'(?:DM|DMSH_VK)_[A-Z0-9_]*[A-Z0-9]'   # the host's and tools' DM_* switches, and the Android shader build's DMSH_VK_* (vk_android_build.py)
+READ = r'(?:getenv\(|environ(?:\.get\(|\[))\s*["\'](' + NAME + r')["\']'   # a literal name in getenv(…), os.environ.get(…) or os.environ[…]
+
+
+def tracked():
+    # android/app/src/main/cpp: the launcher's JNI shim (nxlaunch.c), which reads the game process's own switches (DM_TEST_CRASH)
+    out = subprocess.run(['git', 'ls-files', 'dm', 'scripts', 'docs', 'README.md', 'android/app/src/main/cpp'], cwd=REPO, capture_output=True, text=True, check=True).stdout.split('\n')
+    return [p for p in out if p and 'third_party' not in p.split('/')]
+
+
+def scan():
+    """({switch: files that read it}, {name quoted in the docs: docs})"""
+    reads, docs, macros, direct = {}, {}, set(), set()
+    for p in tracked():
+        path = REPO / p
+        if not path.is_file(): continue
+        text = path.read_text(errors='replace')
+        if p.endswith('.md'):
+            for n in set(re.findall(r'`(' + NAME + r')', text)): docs.setdefault(n, set()).add(p)
+            continue
+        if not p.endswith(CODE) and not p.startswith('scripts/'): continue
+        # names the code defines as preprocessor macros (the generated profile header's DM_GAME_*, host constants) are not switches, unless something also reads
+        # them from the environment (DM_GAME_ENV, which overrides the profile's macro of that name)
+        macros |= set(re.findall(r'#\s*define\s+(' + NAME + r')', text))
+        if '/tests/' in p:   # a test's own switches only; the names in its fixtures are data
+            found = re.findall(READ, text)
+        elif p.endswith('.sh'): found = re.findall(r'\$\{?(' + NAME + r')\b', text) + re.findall(r'["\'](' + NAME + r')["\']', text)
+        else: found = re.findall(r'["\'](' + NAME + r')=?["\']', text)   # any quoted name: helpers such as envdir("DM_TEMP", …) read it for their caller
+        # a numbered family, its name made with a printf format ("DM_ROMFS_PROGRAM_%d": one switch per program index), is the one switch <NAME>_<n>
+        found += [n + '_<n>' for n in re.findall(r'["\'](' + NAME + r')_%[du]["\']', text)]
+        direct |= set(re.findall(READ, text))
+        for n in set(found): reads.setdefault(n, set()).add(p)
+    for n in macros - direct: reads.pop(n, None); docs.pop(n, None)
+    return reads, docs
+
+
+def vendored():
+    """{switch: module} from VENDORED; the module's own sources are checked when its directory exists"""
+    out = {}
+    if VENDORED.exists():
+        for l in VENDORED.read_text().split('\n'):
+            f = l.split('\t')
+            if len(f) == 2 and f[0].startswith(('DM_', 'DMSH_VK_')): out[f[0]] = f[1]
+    return out
+
+
+def vendored_reads(reads):
+    """add the listed switches to reads, as read by their module (checked against its sources when present)"""
+    for n, mod in vendored().items():
+        d = REPO / 'dm/third_party' / mod
+        if d.is_dir():
+            found = set()
+            for f in d.rglob('*'):
+                if f.is_file() and f.suffix in CODE: found |= set(re.findall(READ, f.read_text(errors='replace')))
+            if n not in found: continue
+        reads.setdefault(n, set()).add('dm/third_party/' + mod)
+
+
+def guess(name, files, player):   # a new row's class, for whoever writes its meaning to correct
+    if name in player: return 'player'
+    if all('/tests/' in f for f in files): return 'test'
+    if re.search(r'_(DIR|PATH|FILE|ROOT)$', name): return 'path'
+    return 'diagnostic'
+
+
+def rows():
+    """(table text, rows without a meaning or with an unknown class, names the docs quote that nothing reads)"""
+    reads, docs = scan()
+    vendored_reads(reads)
+    player = {l.split('\t')[0] for l in (REPO / 'dm/games/settings.tsv').read_text().split('\n') if l.startswith('DM_')}
+    kept = {}
+    if TABLE.exists():
+        for l in TABLE.read_text().split('\n'):
+            f = l.split('\t')
+            if len(f) == 3 and f[0].startswith(('DM_', 'DMSH_VK_')): kept[f[0]] = f[1:]
+    out, bad = [], []
+    for n in sorted(reads):
+        cls, meaning = kept.get(n, [guess(n, reads[n], player), ''])
+        if cls not in CLASSES or not meaning.strip(): bad.append(n)
+        out.append(f'{n}\t{cls}\t{meaning}\n')
+    families = [n[:-len('_<n>')] for n in reads if n.endswith('_<n>')]   # the docs name a family as `<NAME>_<n>` (quoted up to <NAME>) or by a member (`<NAME>_0`)
+    unread = sorted(n for n in docs if n not in reads and not n.endswith('_') and not any(n == f or re.fullmatch(re.escape(f) + r'_\d+', n) for f in families))
+    return HEAD + ''.join(out), bad, unread
+
+
+if __name__ == '__main__':
+    text, bad, unread = rows()
+    if unread: print('quoted in the docs but read nowhere (check that each mention says it was removed): ' + ' '.join(unread))
+    if sys.argv[1:] == ['--check']:
+        problems = []
+        if not TABLE.exists() or TABLE.read_text() != text: problems.append('docs/env_switches.tsv does not list the switches the code reads: run dm/tools/env_switches.py, then write the new rows\' meanings')
+        if bad: problems.append('switches without a meaning or a class (one of ' + ', '.join(CLASSES) + '): ' + ' '.join(bad))
+        print('\n'.join(problems))
+        sys.exit(1 if problems else 0)
+    TABLE.write_text(text)
+    print(f'{TABLE.relative_to(REPO)}: {text.count(chr(10)) - 1} switches, {len(bad)} without a meaning')
